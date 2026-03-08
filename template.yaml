@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Telegram Lambda Agent
+  Receives Telegram webhooks, queries Claude with S3 context, can invoke other Lambdas.
+
+# ── Global defaults ───────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]        # Graviton2: cheaper + faster cold starts
+    Timeout: 120                  # seconds (Claude calls can take ~30-60 s)
+    MemorySize: 512               # MB
+    Environment:
+      Variables:
+        LOG_LEVEL: !Ref LogLevel
+        CLAUDE_MODEL: !Ref ClaudeModel
+        MAX_TOKENS: !Ref MaxTokens
+        S3_BUCKET_NAME: !Ref ContextBucketName
+        S3_CONTEXT_PREFIX: !Ref S3ContextPrefix
+        LAMBDA_ALLOWED_FUNCTIONS: !Ref LambdaAllowedFunctions
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+  # Secrets (store in SSM Parameter Store or Secrets Manager in production)
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Description: Anthropic API key (sk-ant-...)
+
+  TelegramBotToken:
+    Type: String
+    NoEcho: true
+    Description: Telegram bot token from @BotFather
+
+  TelegramWebhookSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Optional random string for webhook request verification
+
+  # Config
+  ContextBucketName:
+    Type: String
+    Description: S3 bucket containing context / knowledge files
+
+  S3ContextPrefix:
+    Type: String
+    Default: "context/"
+    Description: S3 key prefix for context documents
+
+  LambdaAllowedFunctions:
+    Type: String
+    Default: ""
+    Description: Comma-separated list of Lambda function names this agent may invoke (empty = all)
+
+  ClaudeModel:
+    Type: String
+    Default: "claude-opus-4-6"
+    Description: Claude model ID
+
+  MaxTokens:
+    Type: Number
+    Default: 4096
+    Description: Maximum output tokens per Claude response
+
+  LogLevel:
+    Type: String
+    Default: "INFO"
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+  AgentSystemPrompt:
+    Type: String
+    Default: ""
+    Description: Optional custom system prompt for Claude
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── IAM role ────────────────────────────────────────────────────────────────
+  AgentFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-agent-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ContextBucketName}"
+                  - !Sub "arn:aws:s3:::${ContextBucketName}/*"
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+
+  # ── Lambda function ──────────────────────────────────────────────────────────
+  TelegramAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-telegram-agent"
+      Description: "Telegram bot agent: Claude + S3 + Lambda invocation"
+      CodeUri: src/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt AgentFunctionRole.Arn
+      Environment:
+        Variables:
+          ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+          TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+          TELEGRAM_WEBHOOK_SECRET: !Ref TelegramWebhookSecret
+          AGENT_SYSTEM_PROMPT: !Ref AgentSystemPrompt
+      Events:
+        TelegramWebhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TelegramWebhookApi
+            Path: /webhook
+            Method: POST
+
+  # ── API Gateway ──────────────────────────────────────────────────────────────
+  TelegramWebhookApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      StageName: prod
+      # Throttle to prevent abuse
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 50
+          ThrottlingBurstLimit: 100
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  WebhookUrl:
+    Description: >
+      Register this URL with Telegram:
+        python scripts/setup_webhook.py
+      or manually:
+        curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<WEBHOOK_URL>"
+    Value: !Sub "https://${TelegramWebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook"
+
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref TelegramAgentFunction
+
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt TelegramAgentFunction.Arn

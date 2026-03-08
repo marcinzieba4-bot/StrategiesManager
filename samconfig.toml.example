@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────────
+#  AWS SAM deploy configuration example
+#  Copy to samconfig.toml and fill in your real values.
+#  samconfig.toml is in .gitignore — do NOT commit it.
+# ─────────────────────────────────────────────────────────────
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name          = "telegram-lambda-agent"
+region              = "us-east-1"
+capabilities        = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+resolve_s3          = true          # SAM auto-creates a deployment bucket
+
+# Override parameter values from template.yaml
+parameter_overrides = """
+  AnthropicApiKey=sk-ant-api03-REPLACE_ME
+  TelegramBotToken=1234567890:ABCdef-REPLACE_ME
+  TelegramWebhookSecret=change-me-to-a-random-string
+  ContextBucketName=my-strategies-bucket
+  S3ContextPrefix=context/
+  LambdaAllowedFunctions=my-strategy-runner,my-data-fetcher
+  ClaudeModel=claude-opus-4-6
+  MaxTokens=4096
+  LogLevel=INFO
+  AgentSystemPrompt=
+"""
