@@ -16,6 +16,7 @@ Environment variables (see .env.example):
     AWS_REGION                AWS region (set automatically by Lambda runtime)
     LAMBDA_INVOKE_REGION      Region for Lambda-to-Lambda calls (default: AWS_REGION)
     LAMBDA_ALLOWED_FUNCTIONS  Comma-separated allow-list of callable Lambda names
+    TELEGRAM_ALLOWED_CHAT_IDS Comma-separated allow-list of chat/user IDs (empty = all)
     LOG_LEVEL                 Python log level (default: INFO)
 """
 from __future__ import annotations
@@ -89,6 +90,15 @@ def _process_update(update: dict) -> None:
     logger.info("Unhandled update type: %s", list(update.keys()))
 
 
+def _is_allowed_chat(chat_id: int) -> bool:
+    """Return True if chat_id is in the allow-list (or if no list is configured)."""
+    raw = os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").strip()
+    if not raw:
+        return True
+    allowed = {s.strip() for s in raw.split(",") if s.strip()}
+    return str(chat_id) in allowed
+
+
 def _handle_message(message: dict) -> None:
     """Process an incoming text message and reply via Claude."""
     chat_id: int = message["chat"]["id"]
@@ -97,6 +107,11 @@ def _handle_message(message: dict) -> None:
     username: str = user.get("username") or user.get("first_name", "User")
 
     bot = TelegramClient(os.environ["TELEGRAM_BOT_TOKEN"])
+
+    if not _is_allowed_chat(chat_id):
+        logger.warning("Blocked message from unauthorized chat_id=%s", chat_id)
+        bot.send_message(chat_id, "Sorry, you are not authorized to use this bot.")
+        return
 
     if not text:
         bot.send_message(chat_id, "Please send a text message.")
