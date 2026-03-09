@@ -30,7 +30,11 @@ class TelegramClient:
         parse_mode: Optional[str] = None,
         reply_to_message_id: Optional[int] = None,
     ) -> dict:
-        """Send a text message, splitting it if it exceeds Telegram's 4096-char limit."""
+        """Send a text message, splitting it if it exceeds Telegram's 4096-char limit.
+
+        If reply_to_message_id is set but the original message was deleted,
+        Telegram returns 400 — in that case we retry without the reply link.
+        """
         chunks = _split_message(text)
         last_response: dict = {}
         for chunk in chunks:
@@ -39,7 +43,16 @@ class TelegramClient:
                 payload["parse_mode"] = parse_mode
             if reply_to_message_id:
                 payload["reply_to_message_id"] = reply_to_message_id
-            last_response = self._call("sendMessage", payload)
+            result = self._call("sendMessage", payload)
+            if not result.get("ok") and reply_to_message_id:
+                # Retry without reply link (original message may have been deleted)
+                logger.warning(
+                    "sendMessage with reply_to=%s failed; retrying without reply link",
+                    reply_to_message_id,
+                )
+                payload.pop("reply_to_message_id", None)
+                result = self._call("sendMessage", payload)
+            last_response = result
         return last_response
 
     def send_chat_action(self, chat_id: int, action: str = "typing") -> dict:
