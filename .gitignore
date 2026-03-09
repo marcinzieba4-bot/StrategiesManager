@@ -18,6 +18,10 @@ build/
 samconfig.toml
 packaged.yaml
 
+# Build artifacts
+.build/
+lambda.zip
+
 # IDE
 .idea/
 .vscode/
