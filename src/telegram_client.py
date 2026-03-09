@@ -52,6 +52,14 @@ class TelegramClient:
                 )
                 payload.pop("reply_to_message_id", None)
                 result = self._call("sendMessage", payload)
+            if not result.get("ok") and parse_mode:
+                # Retry as plain text — Markdown/special chars in content caused parse error
+                logger.warning(
+                    "sendMessage with parse_mode=%s failed; retrying as plain text",
+                    parse_mode,
+                )
+                payload.pop("parse_mode", None)
+                result = self._call("sendMessage", payload)
             last_response = result
         return last_response
 
