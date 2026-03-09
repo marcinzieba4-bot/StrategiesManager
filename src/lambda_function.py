@@ -37,10 +37,10 @@ from telegram_client import TelegramClient
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    format="%(levelname)s %(name)s %(message)s",
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-)
+# basicConfig() is a no-op in Lambda (root logger is pre-configured by runtime).
+# Set level directly on the root logger so INFO+ messages appear in CloudWatch.
+_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.getLogger().setLevel(_log_level)
 logger = logging.getLogger(__name__)
 
 
