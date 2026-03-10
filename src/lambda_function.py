@@ -121,19 +121,26 @@ def _handle_poll() -> dict:
     updates = resp.get("result", [])
     logger.info("Received %d updates", len(updates))
 
-    max_update_id = offset - 1  # will stay < offset if no updates
+    if not updates:
+        return _http(200, "Processed 0 updates")
+
+    max_update_id = max(u["update_id"] for u in updates)
+    new_offset = max_update_id + 1
+
+    # Acknowledge updates with Telegram BEFORE processing.
+    # Calling getUpdates with the new offset tells Telegram these updates
+    # are confirmed and must not be re-delivered. Saving to S3 only is not
+    # enough — if S3 is stale or the invocation crashes, Telegram re-delivers.
+    bot.get_updates(offset=new_offset, limit=1)
+    _save_offset(new_offset)
+    logger.info("Acknowledged updates up to update_id=%s (new_offset=%s)", max_update_id, new_offset)
+
     for update in updates:
         update_id = update["update_id"]
-        if update_id > max_update_id:
-            max_update_id = update_id
         try:
             _process_update(update)
         except Exception:  # noqa: BLE001
             logger.exception("Error processing update_id=%s", update_id)
-
-    if updates:
-        # Advance offset past the last processed update
-        _save_offset(max_update_id + 1)
 
     return _http(200, f"Processed {len(updates)} updates")
 
