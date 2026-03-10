@@ -46,7 +46,7 @@ class S3Reader:
         logger.info("Listed %d keys under s3://%s/%s", len(keys), self.bucket, effective_prefix)
         return keys
 
-    def read_file(self, key: str, max_bytes: int = 512_000) -> str:
+    def read_file(self, key: str, max_bytes: int = 80_000) -> str:
         """Download and return the text content of *key* (up to *max_bytes*)."""
         logger.info("Reading s3://%s/%s", self.bucket, key)
         try:
