@@ -81,14 +81,24 @@ class TelegramClient:
             payload["allowed_updates"] = allowed_updates
         return self._call("setWebhook", payload)
 
-    def delete_webhook(self) -> dict:
-        return self._call("deleteWebhook", {})
+    def delete_webhook(self, drop_pending_updates: bool = False) -> dict:
+        return self._call("deleteWebhook", {"drop_pending_updates": drop_pending_updates})
 
     def get_webhook_info(self) -> dict:
         return self._call("getWebhookInfo", {})
 
     def get_me(self) -> dict:
         return self._call("getMe", {})
+
+    def get_updates(self, offset: int = 0, limit: int = 100) -> dict:
+        """Fetch pending updates (polling mode).
+
+        offset: set to last_update_id + 1 to mark previous updates as read.
+        """
+        payload: dict = {"limit": limit}
+        if offset:
+            payload["offset"] = offset
+        return self._call("getUpdates", payload)
 
     # ── Internal ────────────────────────────────────────────────────────────
 

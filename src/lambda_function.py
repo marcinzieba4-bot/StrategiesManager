@@ -1,15 +1,32 @@
 """
 Telegram Lambda Agent — Main entry point.
 
-Receives Telegram webhook POSTs via API Gateway, calls Claude with S3 context
-and Lambda-invocation tools, and replies to the user in Telegram.
+Operating modes
+───────────────
+POLLING (default, recommended):
+  EventBridge triggers this Lambda every minute.
+  Lambda calls Telegram getUpdates, processes messages, stores the last
+  update_id in S3 so the next invocation starts where this one left off.
+  No public webhook URL required.
+
+WEBHOOK (optional, requires accessible HTTPS endpoint):
+  Telegram POSTs to Lambda Function URL.
+  Handler immediately returns 200 and fires an async self-invocation so
+  Claude has unlimited time to respond.
+
+Admin invocations (call directly via boto3 / AWS CLI):
+  {"admin_action": "poll"}            — run one polling cycle now
+  {"admin_action": "delete_webhook"}  — remove any registered webhook
+  {"admin_action": "get_webhook_info"}
 
 Environment variables (see .env.example):
     ANTHROPIC_API_KEY         Claude API key
     TELEGRAM_BOT_TOKEN        Telegram bot token from @BotFather
-    TELEGRAM_WEBHOOK_SECRET   Optional shared secret for webhook verification
+    TELEGRAM_WEBHOOK_SECRET   Optional shared secret (webhook mode only)
+    LAMBDA_FUNCTION_URL       HTTPS URL for webhook registration (webhook mode only)
     S3_BUCKET_NAME            S3 bucket with context / knowledge files
-    S3_CONTEXT_PREFIX         Key prefix for context files (default: "context/")
+    S3_CONTEXT_PREFIX         Key prefix for context files (default: "Strategies/")
+    S3_STATE_KEY              S3 key for polling offset state (default: "telegram-agent-state.json")
     CLAUDE_MODEL              Claude model ID (default: claude-opus-4-6)
     MAX_TOKENS                Max tokens per response (default: 4096)
     AGENT_SYSTEM_PROMPT       Optional custom system prompt
@@ -28,8 +45,6 @@ import logging
 import os
 from typing import Any
 
-# Lazy imports: boto3 and anthropic are heavy; import at handler level so
-# Lambda can report init errors cleanly.
 from claude_agent import ClaudeAgent
 from lambda_invoker import LambdaInvoker
 from s3_reader import S3Reader
@@ -37,61 +52,237 @@ from telegram_client import TelegramClient
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-# basicConfig() is a no-op in Lambda (root logger is pre-configured by runtime).
-# Set level directly on the root logger so INFO+ messages appear in CloudWatch.
 _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.getLogger().setLevel(_log_level)
 logger = logging.getLogger(__name__)
+
+# ── State keys ───────────────────────────────────────────────────────────────
+
+_S3_STATE_KEY = os.environ.get("S3_STATE_KEY", "telegram-agent-state.json")
 
 
 # ── Lambda handler ────────────────────────────────────────────────────────────
 
 def lambda_handler(event: dict, context: Any) -> dict:  # noqa: ANN401
-    """AWS Lambda entry point.
+    """AWS Lambda entry point."""
+    logger.debug("Raw event: %s", json.dumps(event, default=str)[:300])
 
-    Always returns HTTP 200 to Telegram (even on error) to prevent endless retries.
-    """
-    logger.debug("Raw event: %s", json.dumps(event, default=str)[:1000])
+    # ── Admin actions ────────────────────────────────────────────────────────
+    if "admin_action" in event:
+        return _handle_admin_action(event["admin_action"])
 
-    # 1. Parse body
+    # ── Async task (self-invoked in webhook mode) ────────────────────────────
+    if "async_task" in event:
+        return _handle_async_task(event["async_task"])
+
+    # ── EventBridge polling trigger ──────────────────────────────────────────
+    if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
+        return _handle_poll()
+
+    # ── Telegram webhook (Function URL POST) ─────────────────────────────────
     try:
         body_str, update = _parse_event(event)
     except (ValueError, json.JSONDecodeError) as exc:
         logger.error("Failed to parse event body: %s", exc)
         return _http(400, "Bad Request")
 
-    # 2. Verify Telegram webhook secret
     if not _verify_secret(event, body_str):
         logger.warning("Webhook secret verification failed — dropping request")
         return _http(403, "Forbidden")
 
-    # 3. Process the update (errors are caught so Telegram always gets 200)
+    # Return 200 immediately; process async to beat Telegram's 30-second timeout
+    try:
+        _dispatch_async(update, context)
+        logger.info("Dispatched update async, returning 200 immediately")
+    except Exception:  # noqa: BLE001
+        logger.warning("Async dispatch failed — processing synchronously")
+        try:
+            _process_update(update)
+        except Exception:  # noqa: BLE001
+            logger.exception("Unhandled error in synchronous fallback")
+
+    return _http(200, "OK")
+
+
+# ── Polling mode ──────────────────────────────────────────────────────────────
+
+def _handle_poll() -> dict:
+    """Fetch and process all new Telegram updates since the last run."""
+    bot = TelegramClient(os.environ["TELEGRAM_BOT_TOKEN"])
+    offset = _load_offset()
+
+    logger.info("Polling Telegram updates (offset=%s)", offset)
+    resp = bot.get_updates(offset=offset, limit=100)
+
+    if not resp.get("ok"):
+        logger.error("getUpdates failed: %s", resp)
+        return _http(500, "getUpdates failed")
+
+    updates = resp.get("result", [])
+    logger.info("Received %d updates", len(updates))
+
+    max_update_id = offset - 1  # will stay < offset if no updates
+    for update in updates:
+        update_id = update["update_id"]
+        if update_id > max_update_id:
+            max_update_id = update_id
+        try:
+            _process_update(update)
+        except Exception:  # noqa: BLE001
+            logger.exception("Error processing update_id=%s", update_id)
+
+    if updates:
+        # Advance offset past the last processed update
+        _save_offset(max_update_id + 1)
+
+    return _http(200, f"Processed {len(updates)} updates")
+
+
+def _load_offset() -> int:
+    """Load last processed update_id + 1 from S3."""
+    import boto3
+    bucket = os.environ["S3_BUCKET_NAME"]
+    region = os.environ.get("AWS_REGION", "eu-north-1")
+    try:
+        s3 = boto3.client("s3", region_name=region)
+        obj = s3.get_object(Bucket=bucket, Key=_S3_STATE_KEY)
+        state = json.loads(obj["Body"].read())
+        return int(state.get("next_offset", 0))
+    except Exception:  # noqa: BLE001
+        logger.info("No existing state in S3 — starting from offset 0")
+        return 0
+
+
+def _save_offset(next_offset: int) -> None:
+    """Persist the next polling offset to S3."""
+    import boto3
+    bucket = os.environ["S3_BUCKET_NAME"]
+    region = os.environ.get("AWS_REGION", "eu-north-1")
+    try:
+        s3 = boto3.client("s3", region_name=region)
+        s3.put_object(
+            Bucket=bucket,
+            Key=_S3_STATE_KEY,
+            Body=json.dumps({"next_offset": next_offset}).encode(),
+            ContentType="application/json",
+        )
+        logger.info("Saved next_offset=%s to S3", next_offset)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to save offset to S3")
+
+
+# ── Webhook async dispatch ────────────────────────────────────────────────────
+
+def _dispatch_async(update: dict, context: Any) -> None:
+    """Fire-and-forget: invoke this Lambda async so we return 200 to Telegram fast."""
+    import boto3
+    region = os.environ.get("AWS_REGION", "eu-north-1")
+    client = boto3.client("lambda", region_name=region)
+    client.invoke(
+        FunctionName=context.invoked_function_arn,
+        InvocationType="Event",
+        Payload=json.dumps({"async_task": {"update": update}}).encode(),
+    )
+
+
+def _handle_async_task(task: dict) -> dict:
+    update = task.get("update", {})
     try:
         _process_update(update)
     except Exception:  # noqa: BLE001
-        logger.exception("Unhandled error while processing Telegram update")
-
+        logger.exception("Unhandled error in async task")
     return _http(200, "OK")
+
+
+# ── Admin actions ─────────────────────────────────────────────────────────────
+
+def _handle_admin_action(action: str) -> dict:
+    bot = TelegramClient(os.environ["TELEGRAM_BOT_TOKEN"])
+
+    if action == "get_webhook_info":
+        info = bot.get_webhook_info()
+        logger.info("Webhook info: %s", json.dumps(info))
+        return _http(200, json.dumps(info))
+
+    if action == "delete_webhook":
+        result = bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Deleted webhook: %s", result)
+        return _http(200, json.dumps(result))
+
+    if action == "poll":
+        return _handle_poll()
+
+    if action == "create_schedule":
+        return _create_eventbridge_schedule()
+
+    if action == "setup_webhook":
+        function_url = os.environ.get("LAMBDA_FUNCTION_URL", "").rstrip("/")
+        if not function_url:
+            return _http(500, "LAMBDA_FUNCTION_URL not set")
+        result = bot.set_webhook(
+            url=function_url,
+            allowed_updates=["message", "edited_message", "callback_query"],
+        )
+        logger.info("set_webhook result: %s", result)
+        return _http(200, json.dumps(result))
+
+    logger.warning("Unknown admin_action: %s", action)
+    return _http(400, f"Unknown action: {action}")
+
+
+def _create_eventbridge_schedule() -> dict:
+    """Create (or update) the EventBridge rule that polls Telegram every minute."""
+    import boto3
+    region = os.environ.get("AWS_REGION", "eu-north-1")
+    function_arn = f"arn:aws:lambda:{region}:905418356298:function:telegram-agent"
+    rule_name = "telegram-agent-poller"
+
+    try:
+        events = boto3.client("events", region_name=region)
+        rule = events.put_rule(
+            Name=rule_name,
+            ScheduleExpression="rate(1 minute)",
+            State="ENABLED",
+            Description="Polls Telegram for new messages every minute",
+        )
+        rule_arn = rule["RuleArn"]
+        events.put_targets(
+            Rule=rule_name,
+            Targets=[{"Id": "telegram-agent", "Arn": function_arn}],
+        )
+        # Grant EventBridge permission to invoke Lambda
+        lamb = boto3.client("lambda", region_name=region)
+        try:
+            lamb.add_permission(
+                FunctionName="telegram-agent",
+                StatementId="allow-eventbridge-poller",
+                Action="lambda:InvokeFunction",
+                Principal="events.amazonaws.com",
+                SourceArn=rule_arn,
+            )
+        except lamb.exceptions.ResourceConflictException:
+            pass  # Permission already exists
+        logger.info("EventBridge rule created: %s", rule_arn)
+        return _http(200, json.dumps({"ok": True, "rule_arn": rule_arn}))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to create EventBridge rule")
+        return _http(500, str(exc))
 
 
 # ── Update processing ─────────────────────────────────────────────────────────
 
 def _process_update(update: dict) -> None:
-    """Route a Telegram update to the appropriate handler."""
     message = update.get("message") or update.get("edited_message")
     if message:
         _handle_message(message)
         return
-
     if update.get("callback_query"):
-        logger.info("Callback query received — not handled yet")
+        logger.info("Callback query — not handled")
         return
-
-    logger.info("Unhandled update type: %s", list(update.keys()))
+    logger.debug("Unhandled update type: %s", list(update.keys()))
 
 
 def _is_allowed_chat(chat_id: int) -> bool:
-    """Return True if chat_id is in the allow-list (or if no list is configured)."""
     raw = os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").strip()
     if not raw:
         return True
@@ -100,7 +291,6 @@ def _is_allowed_chat(chat_id: int) -> bool:
 
 
 def _handle_message(message: dict) -> None:
-    """Process an incoming text message and reply via Claude."""
     chat_id: int = message["chat"]["id"]
     text: str = message.get("text", "").strip()
     user: dict = message.get("from", {})
@@ -109,24 +299,22 @@ def _handle_message(message: dict) -> None:
     bot = TelegramClient(os.environ["TELEGRAM_BOT_TOKEN"])
 
     if not _is_allowed_chat(chat_id):
-        logger.warning("Blocked message from unauthorized chat_id=%s", chat_id)
+        logger.warning("Blocked unauthorized chat_id=%s", chat_id)
         bot.send_message(chat_id, "Sorry, you are not authorized to use this bot.")
         return
 
     if not text:
-        bot.send_message(chat_id, "Please send a text message.")
         return
 
-    # Show typing indicator while we process
+    logger.info("User '%s' (chat=%s) sent: %s", username, chat_id, text[:200])
     bot.send_chat_action(chat_id, "typing")
 
-    # Build agent
-    region = os.environ.get("AWS_REGION", "us-east-1")
+    region = os.environ.get("AWS_REGION", "eu-north-1")
     agent = ClaudeAgent(
         s3_reader=S3Reader(
             bucket=os.environ["S3_BUCKET_NAME"],
             region=region,
-            default_prefix=os.environ.get("S3_CONTEXT_PREFIX", "context/"),
+            default_prefix=os.environ.get("S3_CONTEXT_PREFIX", "Strategies/"),
         ),
         lambda_invoker=LambdaInvoker(
             region=os.environ.get("LAMBDA_INVOKE_REGION", region),
@@ -136,10 +324,8 @@ def _handle_message(message: dict) -> None:
         system_prompt=os.environ.get("AGENT_SYSTEM_PROMPT", ""),
     )
 
-    # Run agent
     reply = agent.chat(user_message=text, username=username)
 
-    # Send reply (auto-splits if > 4096 chars)
     bot.send_message(
         chat_id,
         reply,
@@ -152,7 +338,6 @@ def _handle_message(message: dict) -> None:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_event(event: dict) -> tuple[str, dict]:
-    """Return (raw_body_str, parsed_update_dict)."""
     raw = event.get("body", event)
     if isinstance(raw, str):
         return raw, json.loads(raw)
@@ -162,22 +347,17 @@ def _parse_event(event: dict) -> tuple[str, dict]:
 
 
 def _verify_secret(event: dict, body_str: str) -> bool:
-    """Verify the optional Telegram webhook secret token."""
     secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
     if not secret:
-        return True  # No verification configured
-
+        return True
     headers: dict = event.get("headers") or {}
-    # API Gateway may lowercase header names
-    provided_token = (
+    provided = (
         headers.get("X-Telegram-Bot-Api-Secret-Token")
         or headers.get("x-telegram-bot-api-secret-token")
         or ""
     )
-
-    # Telegram signs with HMAC-SHA256 of the raw body using the secret as key
     mac = hmac.new(secret.encode(), body_str.encode(), hashlib.sha256)
-    return hmac.compare_digest(mac.hexdigest(), provided_token)
+    return hmac.compare_digest(mac.hexdigest(), provided)
 
 
 def _http(status: int, body: str) -> dict:
